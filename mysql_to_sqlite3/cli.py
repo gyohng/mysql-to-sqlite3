@@ -97,6 +97,13 @@ from .sqlite_utils import CollatingSequences
     default=200000,  # this default is here for performance reasons
     help="Chunk reading/writing SQL records",
 )
+@click.option(
+    "--rows-per-select",
+    type=int,
+    default=0,
+    help="Maximum rows per remote SELECT "
+    "(when > 0, it automatically enables buffered cursors)",
+)
 @click.option("-l", "--log-file", type=click.Path(), help="Log file")
 @click.option("--json-as-text", is_flag=True, help="Transfer JSON columns as TEXT.")
 @click.option(
@@ -137,6 +144,7 @@ def cli(
     json_as_text: bool,
     vacuum: bool,
     use_buffered_cursors: bool,
+    rows_per_select: int,
     quiet: bool,
     debug: bool,
 ) -> None:
@@ -164,6 +172,7 @@ def cli(
             json_as_text=json_as_text,
             vacuum=vacuum,
             buffered=use_buffered_cursors,
+            select_maxrows=rows_per_select,
             log_file=log_file,
             quiet=quiet,
         )

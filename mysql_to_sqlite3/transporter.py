@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import typing as t
 from datetime import timedelta
 from decimal import Decimal
@@ -94,6 +95,11 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         self._chunk_size = kwargs.get("chunk") or None
 
         self._buffered = kwargs.get("buffered") or False
+
+        self._select_maxrows = kwargs.get("select_maxrows") or -1
+
+        if self._select_maxrows > 0 or self._limit_rows > 0:
+            self._buffered = True
 
         self._vacuum = kwargs.get("vacuum") or False
 
@@ -376,7 +382,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         primary: str = ""
         indices: str = ""
 
-        self._mysql_cur_dict.execute(f"SHOW COLUMNS FROM `{table_name}`")
+        self._mysql_execute_robust(self._mysql_cur_dict, f"SHOW COLUMNS FROM `{table_name}`")
 
         for row in self._mysql_cur_dict.fetchall():
             if row is not None:
@@ -477,6 +483,31 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         return sql
 
+    # mysql robust execute with reconnect, takes cursor as a parameter
+    def _mysql_execute_robust(self, cursor: MySQLConnectionAbstract, sql: str) -> None:
+        RETRIES = 10
+        def do_reconnect():
+            if not self._mysql.is_connected():
+                self._mysql.reconnect()
+                self._mysql_cur = self._mysql.cursor(buffered=self._buffered, raw=True)  # type: ignore[assignment]
+                self._mysql_cur_prepared = self._mysql.cursor(prepared=True)  # type: ignore[assignment]
+                self._mysql_cur_dict = self._mysql.cursor(  # type: ignore[assignment]
+                    buffered=self._buffered,
+                    dictionary=True,
+                )
+
+        for i in range(RETRIES):
+            try:
+                cursor.execute(sql) 
+                return         
+            except Exception as err:        
+                if i < RETRIES-1 and ('timeout' in repr(err) or not self._mysql.is_connected()):
+                    self._logger.warning("Connection to MySQL server lost. Attempting to reconnect.")
+                    do_reconnect()
+                else:
+                    self._logger.error("MySQL failed executing query: %s", err)
+                    raise
+
     def _create_table(self, table_name: str, attempting_reconnect: bool = False) -> None:
         try:
             if attempting_reconnect:
@@ -569,7 +600,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 self._exclude_mysql_tables if len(self._exclude_mysql_tables) > 0 else self._mysql_tables
             )
 
-            self._mysql_cur_prepared.execute(
+            self._mysql_execute_robust(self._mysql_cur_prepared,
                 """
                 SELECT TABLE_NAME
                 FROM information_schema.TABLES
@@ -584,7 +615,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             tables: t.Iterable[ToPythonOutputTypes] = (row[0] for row in self._mysql_cur_prepared.fetchall())
         else:
             # transfer all tables
-            self._mysql_cur.execute(
+            self._mysql_execute_robust(self._mysql_cur,
                 """
                 SELECT TABLE_NAME
                 FROM information_schema.TABLES
@@ -617,13 +648,13 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     # get the size of the data
                     if self._limit_rows > 0:
                         # limit to the requested number of rows
-                        self._mysql_cur_dict.execute(
+                        self._mysql_execute_robust(self._mysql_cur_dict,
                             "SELECT COUNT(*) AS `total_records` "
                             f"FROM (SELECT * FROM `{table_name}` LIMIT {self._limit_rows}) AS `table`"
                         )
                     else:
                         # get all rows
-                        self._mysql_cur_dict.execute(f"SELECT COUNT(*) AS `total_records` FROM `{table_name}`")
+                        self._mysql_execute_robust(self._mysql_cur_dict, f"SELECT COUNT(*) AS `total_records` FROM `{table_name}`")
 
                     total_records: t.Optional[t.Dict[str, ToPythonOutputTypes]] = self._mysql_cur_dict.fetchone()
                     if total_records is not None:
@@ -633,30 +664,59 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
                     # only continue if there is anything to transfer
                     if total_records_count > 0:
-                        # populate it
-                        self._mysql_cur.execute(
-                            "SELECT * FROM `{table_name}` {limit}".format(
-                                table_name=table_name,
-                                limit=f"LIMIT {self._limit_rows}" if self._limit_rows > 0 else "",
+                        limit_offset = 0
+                        while True:
+                            query_rows = None
+                            remaining_rows = total_records_count - limit_offset
+                            if self._select_maxrows > 0:
+                                query_rows = self._select_maxrows
+                            if self._limit_rows > 0:
+                                remaining_rows = self._limit_rows - limit_offset
+                                if remaining_rows <= 0:
+                                    break
+                                if query_rows is None or query_rows > remaining_rows:
+                                    query_rows = remaining_rows                            
+
+                            limit_clause = f'OFFSET {limit_offset}' if limit_offset > 0 else ''
+                            if query_rows is not None:
+                                limit_clause = f"LIMIT {query_rows} " + limit_clause
+
+                            self._mysql_execute_robust(self._mysql_cur,
+                                "SELECT * FROM `{table_name}` {limit}".format(
+                                    table_name=table_name,
+                                    limit=limit_clause
+                                )
                             )
-                        )
-                        columns: t.Tuple[str, ...] = tuple(column[0] for column in self._mysql_cur.description)  # type: ignore[union-attr]
-                        # build the SQL string
-                        sql = """
-                            INSERT OR IGNORE
-                            INTO "{table}" ({fields})
-                            VALUES ({placeholders})
-                        """.format(
-                            table=table_name,
-                            fields=('"{}", ' * len(columns)).rstrip(" ,").format(*columns),
-                            placeholders=("?, " * len(columns)).rstrip(" ,"),
-                        )
-                        self._transfer_table_data(
-                            table_name=table_name,  # type: ignore[arg-type]
-                            sql=sql,
-                            total_records=total_records_count,
-                        )
-        except Exception:  # pylint: disable=W0706
+
+                            if self._mysql_cur.rowcount == 0 and limit_offset > 0:
+                                break
+
+                            if query_rows is not None and query_rows > 0:
+                                self._logger.info(
+                                    f"Fetching from `{table_name}` rows {limit_offset}...{min(limit_offset+query_rows-1, limit_offset+remaining_rows-1)}: "
+                                    f"returned {self._mysql_cur.rowcount}"
+                                )
+
+                            limit_offset += self._mysql_cur.rowcount
+
+                            columns: t.Tuple[str, ...] = tuple(column[0] for column in self._mysql_cur.description)  # type: ignore[union-attr]
+                            # build the SQL string
+                            sql = """
+                                INSERT OR IGNORE
+                                INTO "{table}" ({fields})
+                                VALUES ({placeholders})
+                            """.format(
+                                table=table_name,
+                                fields=('"{}", ' * len(columns)).rstrip(" ,").format(*columns),
+                                placeholders=("?, " * len(columns)).rstrip(" ,"),
+                            )
+                            self._transfer_table_data(
+                                table_name=table_name,  # type: ignore[arg-type]
+                                sql=sql,
+                                total_records=self._mysql_cur.rowcount,
+                            )
+        except Exception as e:  # pylint: disable=W0706
+            self._logger.error("Error transferring table %s: %s", table_name, e)
             raise
         finally:
             # re-enable foreign key checking once done transferring
