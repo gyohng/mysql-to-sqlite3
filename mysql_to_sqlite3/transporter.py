@@ -501,7 +501,8 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 cursor.execute(sql) 
                 return         
             except Exception as err:        
-                if i < RETRIES-1 and ('timeout' in repr(err) or not self._mysql.is_connected()):
+                repr_err = repr(err)
+                if i < RETRIES-1 and ('timeout' in repr_err or 'envelope' in repr_err or not self._mysql.is_connected()):
                     self._logger.warning("Connection to MySQL server lost. Attempting to reconnect.")
                     do_reconnect()
                 else:

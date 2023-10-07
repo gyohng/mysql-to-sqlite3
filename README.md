@@ -1,3 +1,10 @@
+# Modifications
+
+This repository have been modified to support downloading Planetscale databases.
+Specifically, the software was extended with a maximum rows per SELECT parameter
+and made robust in relation to Planetscale mysql (Vitess) timeout disconnections.
+
+
 [![PyPI](https://img.shields.io/pypi/v/mysql-to-sqlite3)](https://pypi.org/project/mysql-to-sqlite3/)
 [![Downloads](https://pepy.tech/badge/mysql-to-sqlite3)](https://pepy.tech/project/mysql-to-sqlite3)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/mysql-to-sqlite3)](https://pypi.org/project/mysql-to-sqlite3/)
