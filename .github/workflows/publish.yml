@@ -17,6 +17,7 @@ jobs:
       url: https://pypi.org/p/mysql-to-sqlite3
     permissions:
       id-token: write
+      contents: write
     steps:
       - uses: actions/checkout@v3
       - name: Compare package version with ref/tag
@@ -80,7 +81,7 @@ jobs:
         with:
           name: ${{ env.VERSION }}
           tag_name: ${{ github.ref }}
-          body: ${{ env.CHANGELOG_PATH }}
+          body_path: ${{ env.CHANGELOG_PATH }}
           files: |
             dist/*.whl
             dist/*.tar.gz
